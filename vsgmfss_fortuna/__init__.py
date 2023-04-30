@@ -110,7 +110,7 @@ def gmfss_fortuna(
     if scale not in [0.25, 0.5, 1.0, 2.0, 4.0]:
         raise vs.Error("gmfss_fortuna: scale must be 0.25, 0.5, 1.0, 2.0, or 4.0")
 
-    torch.set_float32_matmul_precision("high")
+    torch.set_float32_matmul_precision("medium")
 
     fp16 = clip.format.bits_per_sample == 16
     dtype = torch.half if fp16 else torch.float
