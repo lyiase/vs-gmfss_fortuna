@@ -58,6 +58,7 @@ class GMFSS(nn.Module):
 
         return flow01, flow10, metric0, metric1, feat_ext0, feat_ext1
 
+    @torch.compile(mode="default", fullgraph=True)
     def forward(self, img0, img1, timestep):
         reuse_things = self.reuse(img0, img1)
         flow01, metric0, feat11, feat12, feat13 = reuse_things[0], reuse_things[2], reuse_things[4][0], reuse_things[4][1], reuse_things[4][2]
