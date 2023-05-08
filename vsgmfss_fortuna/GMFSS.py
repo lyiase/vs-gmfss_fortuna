@@ -84,7 +84,7 @@ class GMFSS(nn.Module):
         return flow01, flow10, metric0, metric1, feat_ext0, feat_ext1
 
     @torch.compile(mode="default", fullgraph=True)
-    def feature_and_flow_extraction(img0, img1):
+    def feature_and_flow_extraction(self, img0, img1, timestep):
         reuse_things = self.reuse(img0, img1)
         flow01, metric0, feat11, feat12, feat13 = (
             reuse_things[0],
@@ -136,7 +136,7 @@ class GMFSS(nn.Module):
         )
 
     def forward(self, img0, img1, timestep):
-        F1t, F2t, Z1t, Z2t = self.feature_and_flow_extraction(img0, img1)
+        F1t, F2t, Z1t, Z2t = self.feature_and_flow_extraction(img0, img1, timestep)
 
         img0 = F.interpolate(img0, scale_factor=0.5, mode="bilinear")
         I1t = warp(img0, F1t, Z1t, strMode="soft")
