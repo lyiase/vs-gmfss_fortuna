@@ -16,7 +16,6 @@ from torch_tensorrt.fx.lower import Lowerer
 from torch_tensorrt.fx.utils import LowerPrecision
 
 from .gmflow.transformer import FeatureTransformer
-from .GMFSS import GMFSS
 
 __version__ = "1.0.0"
 
@@ -42,6 +41,7 @@ def gmfss_fortuna(
     ensemble: bool = False,
     sc: bool = True,
     sc_threshold: float | None = None,
+    torch_compile: bool = False,
 ) -> vs.VideoNode:
     """The All-In-One GMFSS: Dedicated for Anime Video Frame Interpolation
 
@@ -85,7 +85,9 @@ def gmfss_fortuna(
         raise vs.Error("gmfss_fortuna: num_streams must be at least 1")
 
     if num_streams > vs.core.num_threads:
-        raise vs.Error("gmfss_fortuna: setting num_streams greater than `core.num_threads` is useless")
+        raise vs.Error(
+            "gmfss_fortuna: setting num_streams greater than `core.num_threads` is useless"
+        )
 
     if model not in range(2):
         raise vs.Error("gmfss_fortuna: model must be 0 or 1")
@@ -122,6 +124,10 @@ def gmfss_fortuna(
 
     model_type = "base" if model == 0 else "union"
 
+    if torch_compile:
+        from .GMFSS_compile import GMFSS
+    if not torch_compile:
+        from .GMFSS import GMFSS
     module = GMFSS(model_dir, model_type, scale, ensemble)
     module.eval().to(device, memory_format=torch.channels_last)
     if fp16:
@@ -162,11 +168,16 @@ def gmfss_fortuna(
                 | 1 << int(tensorrt.TacticSource.JIT_CONVOLUTIONS),
             )
             lowerer = Lowerer.create(lower_setting=lower_setting)
+
             module = lowerer(
                 module,
                 [
-                    torch.zeros((1, 3, ph, pw), dtype=dtype, device=device).to(memory_format=torch.channels_last),
-                    torch.zeros((1, 3, ph, pw), dtype=dtype, device=device).to(memory_format=torch.channels_last),
+                    torch.zeros((1, 3, ph, pw), dtype=dtype, device=device).to(
+                        memory_format=torch.channels_last
+                    ),
+                    torch.zeros((1, 3, ph, pw), dtype=dtype, device=device).to(
+                        memory_format=torch.channels_last
+                    ),
                     torch.zeros((1,), dtype=dtype, device=device),
                 ],
             )
@@ -204,7 +215,9 @@ def gmfss_fortuna(
             img0 = F.interpolate(img0, (ph, pw), mode="bilinear")
             img1 = F.interpolate(img1, (ph, pw), mode="bilinear")
 
-            timestep = torch.tensor([remainder / factor_num], dtype=dtype, device=device)
+            timestep = torch.tensor(
+                [remainder / factor_num], dtype=dtype, device=device
+            )
 
             if trt:
                 output = module[local_index](img0, img1, timestep)
@@ -223,7 +236,10 @@ def gmfss_fortuna(
     if factor_den > 1:
         clip1 = clip1.std.SelectEvery(cycle=factor_den, offsets=0)
 
-    return clip0.std.FrameEval(lambda n: clip0.std.ModifyFrame([clip0, clip1], inference), clip_src=[clip0, clip1])
+    return clip0.std.FrameEval(
+        lambda n: clip0.std.ModifyFrame([clip0, clip1], inference),
+        clip_src=[clip0, clip1],
+    )
 
 
 def sc_detect(clip: vs.VideoNode, threshold: float) -> vs.VideoNode:
@@ -233,13 +249,25 @@ def sc_detect(clip: vs.VideoNode, threshold: float) -> vs.VideoNode:
         fout.props["_SceneChangeNext"] = f[1].props["_SceneChangeNext"]
         return fout
 
-    sc_clip = clip.resize.Bicubic(format=vs.GRAY8, matrix_s="709").misc.SCDetect(threshold)
-    return clip.std.FrameEval(lambda n: clip.std.ModifyFrame([clip, sc_clip], copy_property), clip_src=[clip, sc_clip])
+    sc_clip = clip.resize.Bicubic(format=vs.GRAY8, matrix_s="709").misc.SCDetect(
+        threshold
+    )
+    return clip.std.FrameEval(
+        lambda n: clip.std.ModifyFrame([clip, sc_clip], copy_property),
+        clip_src=[clip, sc_clip],
+    )
 
 
 def frame_to_tensor(frame: vs.VideoFrame, device: torch.device) -> torch.Tensor:
-    array = np.stack([np.asarray(frame[plane]) for plane in range(frame.format.num_planes)])
-    return torch.from_numpy(array).unsqueeze(0).to(device, memory_format=torch.channels_last).clamp(0.0, 1.0)
+    array = np.stack(
+        [np.asarray(frame[plane]) for plane in range(frame.format.num_planes)]
+    )
+    return (
+        torch.from_numpy(array)
+        .unsqueeze(0)
+        .to(device, memory_format=torch.channels_last)
+        .clamp(0.0, 1.0)
+    )
 
 
 def tensor_to_frame(tensor: torch.Tensor, frame: vs.VideoFrame) -> vs.VideoFrame:
