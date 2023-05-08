@@ -9,7 +9,7 @@ from .gmflow.gmflow import GMFlow
 from .IFNet_HDv3 import IFNet
 from .MetricNet import MetricNet
 from .softsplat import softsplat as warp
-
+torch._dynamo.config.suppress_errors = True
 torch.fx.wrap("warp")
 
 
@@ -51,6 +51,7 @@ class GMFSS(nn.Module):
         self.model_type = model_type
         self.scale = scale
 
+    @torch.compile(mode="default", fullgraph=True)
     def reuse(self, img0, img1):
         feat11, feat12, feat13 = self.feat_ext(img0)
         feat21, feat22, feat23 = self.feat_ext(img1)
@@ -82,6 +83,7 @@ class GMFSS(nn.Module):
 
         return flow01, flow10, metric0, metric1, feat_ext0, feat_ext1
 
+    @torch.compile(mode="default", fullgraph=True)
     def feature_and_flow_extraction(self, img0, img1, timestep):
         reuse_things = self.reuse(img0, img1)
         flow01, metric0, feat11, feat12, feat13 = (
@@ -106,6 +108,7 @@ class GMFSS(nn.Module):
         Z2t = (1 - timestep) * metric1
         return F1t, F2t, Z1t, Z2t, feat11, feat12, feat13, feat21, feat22, feat23
 
+    @torch.compile(mode="default", fullgraph=True)
     def apply_fusion(
         self,
         I1t,
