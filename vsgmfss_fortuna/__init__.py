@@ -16,6 +16,7 @@ from torch_tensorrt.fx.lower import Lowerer
 from torch_tensorrt.fx.utils import LowerPrecision
 
 from .gmflow.transformer import FeatureTransformer
+from .GMFSS import GMFSS
 
 __version__ = "1.0.0"
 
@@ -41,7 +42,7 @@ def gmfss_fortuna(
     ensemble: bool = False,
     sc: bool = True,
     sc_threshold: float | None = None,
-    torch_compile: bool = False,
+    multi: int = 1,
 ) -> vs.VideoNode:
     """The All-In-One GMFSS: Dedicated for Anime Video Frame Interpolation
 
@@ -68,6 +69,7 @@ def gmfss_fortuna(
     :param sc:                      Avoid interpolating frames over scene changes.
     :param sc_threshold:            Threshold for scene change detection. Must be between 0.0 and 1.0.
                                     Leave it None if the clip already has _SceneChangeNext properly set.
+    :param multi:                   Maximum number of previous frames to use for interpolation (1 to 7).
     """
     if not isinstance(clip, vs.VideoNode):
         raise vs.Error("gmfss_fortuna: this is not a clip")
@@ -85,9 +87,7 @@ def gmfss_fortuna(
         raise vs.Error("gmfss_fortuna: num_streams must be at least 1")
 
     if num_streams > vs.core.num_threads:
-        raise vs.Error(
-            "gmfss_fortuna: setting num_streams greater than `core.num_threads` is useless"
-        )
+        raise vs.Error("gmfss_fortuna: setting num_streams greater than `core.num_threads` is useless")
 
     if model not in range(2):
         raise vs.Error("gmfss_fortuna: model must be 0 or 1")
@@ -112,7 +112,10 @@ def gmfss_fortuna(
     if scale not in [0.25, 0.5, 1.0, 2.0, 4.0]:
         raise vs.Error("gmfss_fortuna: scale must be 0.25, 0.5, 1.0, 2.0, or 4.0")
 
-    torch.set_float32_matmul_precision("medium")
+    if not 1 <= multi <= 7:
+        raise vs.Error("gmfss_fortuna: multi must be between 1 and 7")
+
+    torch.set_float32_matmul_precision("high")
 
     fp16 = clip.format.bits_per_sample == 16
     dtype = torch.half if fp16 else torch.float
@@ -124,10 +127,6 @@ def gmfss_fortuna(
 
     model_type = "base" if model == 0 else "union"
 
-    if torch_compile:
-        from .GMFSS_compile import GMFSS
-    if not torch_compile:
-        from .GMFSS import GMFSS
     module = GMFSS(model_dir, model_type, scale, ensemble)
     module.eval().to(device, memory_format=torch.channels_last)
     if fp16:
@@ -168,16 +167,11 @@ def gmfss_fortuna(
                 | 1 << int(tensorrt.TacticSource.JIT_CONVOLUTIONS),
             )
             lowerer = Lowerer.create(lower_setting=lower_setting)
-
             module = lowerer(
                 module,
                 [
-                    torch.zeros((1, 3, ph, pw), dtype=dtype, device=device).to(
-                        memory_format=torch.channels_last
-                    ),
-                    torch.zeros((1, 3, ph, pw), dtype=dtype, device=device).to(
-                        memory_format=torch.channels_last
-                    ),
+                    torch.zeros((1, 3, ph, pw), dtype=dtype, device=device).to(memory_format=torch.channels_last),
+                    torch.zeros((1, 3, ph, pw), dtype=dtype, device=device).to(memory_format=torch.channels_last),
                     torch.zeros((1,), dtype=dtype, device=device),
                 ],
             )
@@ -194,14 +188,25 @@ def gmfss_fortuna(
     if sc_threshold is not None:
         clip = sc_detect(clip, sc_threshold)
 
+    # Detect duplicate frames and store duplicate counts
+    clip = detect_duplicate_frames(clip)
+
     index = -1
     index_lock = Lock()
 
     @torch.inference_mode()
     def inference(n: int, f: list[vs.VideoFrame]) -> vs.VideoFrame:
+        current_props = f[0].props
+        dup_count = current_props.get("_DuplicateCount", 1)
+        use_multi = min(multi, dup_count - 1)
+
         remainder = n * factor_den % factor_num
 
-        if remainder == 0 or (sc and f[0].props.get("_SceneChangeNext")):
+        # 重複フレームの場合は処理をスキップ
+        if dup_count > 1:
+            return f[0]
+
+        if remainder == 0 or (sc and current_props.get("_SceneChangeNext")):
             return f[0]
 
         nonlocal index
@@ -211,13 +216,11 @@ def gmfss_fortuna(
 
         with stream_lock[local_index], torch.cuda.stream(stream[local_index]):
             img0 = frame_to_tensor(f[0], device)
-            img1 = frame_to_tensor(f[1], device)
+            img1 = frame_to_tensor(f[use_multi], device)
             img0 = F.interpolate(img0, (ph, pw), mode="bilinear")
             img1 = F.interpolate(img1, (ph, pw), mode="bilinear")
 
-            timestep = torch.tensor(
-                [remainder / factor_num], dtype=dtype, device=device
-            )
+            timestep = torch.tensor([remainder / factor_num * (use_multi + 1)], dtype=dtype, device=device)
 
             if trt:
                 output = module[local_index](img0, img1, timestep)
@@ -227,19 +230,19 @@ def gmfss_fortuna(
             output = F.interpolate(output, (clip.height, clip.width), mode="bilinear")
             return tensor_to_frame(output, f[0].copy())
 
+    # Prepare list of shifted clips
+    clip_list = [clip]
+    for i in range(1, multi + 1):
+        shifted_clip = clip.std.BlankClip(clip, length=i) + clip
+        shifted_clip = shifted_clip.std.Trim(end=clip.num_frames - 1)
+        clip_list.append(shifted_clip)
+
+    # Interleave frames based on factor_num and factor_den
     clip0 = vs.core.std.Interleave([clip] * factor_num)
     if factor_den > 1:
         clip0 = clip0.std.SelectEvery(cycle=factor_den, offsets=0)
 
-    clip1 = clip.std.DuplicateFrames(frames=clip.num_frames - 1).std.Trim(first=1)
-    clip1 = vs.core.std.Interleave([clip1] * factor_num)
-    if factor_den > 1:
-        clip1 = clip1.std.SelectEvery(cycle=factor_den, offsets=0)
-
-    return clip0.std.FrameEval(
-        lambda n: clip0.std.ModifyFrame([clip0, clip1], inference),
-        clip_src=[clip0, clip1],
-    )
+    return clip0.std.FrameEval(lambda n: clip0.std.ModifyFrame(clip_list, inference), clip_src=clip_list)
 
 
 def sc_detect(clip: vs.VideoNode, threshold: float) -> vs.VideoNode:
@@ -249,25 +252,37 @@ def sc_detect(clip: vs.VideoNode, threshold: float) -> vs.VideoNode:
         fout.props["_SceneChangeNext"] = f[1].props["_SceneChangeNext"]
         return fout
 
-    sc_clip = clip.resize.Bicubic(format=vs.GRAY8, matrix_s="709").misc.SCDetect(
-        threshold
-    )
-    return clip.std.FrameEval(
-        lambda n: clip.std.ModifyFrame([clip, sc_clip], copy_property),
-        clip_src=[clip, sc_clip],
+    sc_clip = clip.resize.Bicubic(format=vs.GRAY8, matrix_s="709").misc.SCDetect(threshold)
+    return clip.std.FrameEval(lambda n: clip.std.ModifyFrame([clip, sc_clip], copy_property), clip_src=[clip, sc_clip])
+
+
+def detect_duplicate_frames(clip: vs.VideoNode) -> vs.VideoNode:
+    # Use PlaneStats to detect duplicate frames
+    def calculate_duplicate(n: int, f: list[vs.VideoFrame]) -> vs.VideoFrame:
+        curr_frame = f[0]
+        prev_frame = f[1] if n > 0 else f[0]
+        diff = curr_frame.props['PlaneStatsDiff']
+        is_duplicate = diff < 0.0001  # You may adjust this threshold
+        if is_duplicate:
+            dup_count = prev_frame.props.get('_DuplicateCount', 1) + 1
+        else:
+            dup_count = 1
+        curr_frame = curr_frame.copy()
+        curr_frame.props['_DuplicateCount'] = dup_count
+        return curr_frame
+
+    planes = [0]  # You can adjust this to consider different planes
+    stat_clip = clip.std.PlaneStats(plane=planes[0])
+    clips = [stat_clip, stat_clip.std.DuplicateFrames(frames=0).std.Trim(first=1)]
+    return stat_clip.std.FrameEval(
+        calculate_duplicate,
+        clip_src=clips
     )
 
 
 def frame_to_tensor(frame: vs.VideoFrame, device: torch.device) -> torch.Tensor:
-    array = np.stack(
-        [np.asarray(frame[plane]) for plane in range(frame.format.num_planes)]
-    )
-    return (
-        torch.from_numpy(array)
-        .unsqueeze(0)
-        .to(device, memory_format=torch.channels_last)
-        .clamp(0.0, 1.0)
-    )
+    array = np.stack([np.asarray(frame[plane]) for plane in range(frame.format.num_planes)])
+    return torch.from_numpy(array).unsqueeze(0).to(device, memory_format=torch.channels_last).clamp(0.0, 1.0)
 
 
 def tensor_to_frame(tensor: torch.Tensor, frame: vs.VideoFrame) -> vs.VideoFrame:
