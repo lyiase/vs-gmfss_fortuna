@@ -202,6 +202,10 @@ def gmfss_fortuna(
 
         remainder = n * factor_den % factor_num
 
+        # 重複フレームの場合は処理をスキップ
+        if dup_count > 1:
+            return f[0]
+
         if remainder == 0 or (sc and current_props.get("_SceneChangeNext")):
             return f[0]
 
